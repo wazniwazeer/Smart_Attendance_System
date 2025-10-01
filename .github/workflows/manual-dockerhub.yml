@@ -1,25 +1,10 @@
-name: Manual CI/CD (Docker Hub)
+name: CI Build & Push (GHCR)
 
 on:
-  workflow_dispatch:
-    inputs:
-      build_ref:
-        description: "Git ref (branch, tag, or SHA) to build"
-        required: true
-        default: "main"
-      image_tag:
-        description: "Extra image tag (optional, e.g. v1.0.0 or test)"
-        required: false
-      push_image:
-        description: "Push image to Docker Hub?"
-        type: boolean
-        required: true
-        default: true
-      deploy:
-        description: "Deploy to server via SSH?"
-        type: boolean
-        required: true
-        default: false
+  push:
+    branches: [ main ]
+    tags: [ "v*" ]
+  pull_request:
 
 env:
   DOCKER_BUILDKIT: "1"
@@ -29,126 +14,68 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: read
-    outputs:
-      sha: ${{ steps.meta.outputs.sha }}
-      image: ${{ steps.repo.outputs.image }}
+      packages: write   # required to push to GHCR
     steps:
-      - name: Checkout (with LFS if you track weights)
+      - name: Checkout (with LFS for big model files)
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.build_ref }}
           lfs: true
 
       - name: Set up QEMU (optional for multi-arch)
         uses: docker/setup-qemu-action@v3
 
-      - name: Set up Docker Buildx
+      - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Compute a proper Docker Hub image name from your secret username
-      - name: Set image name
-        id: repo
+      - name: Compute image name (lowercase) and tags
+        id: vars
         shell: bash
         run: |
-          if [ -z "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
-            echo "::error ::Secret DOCKERHUB_USERNAME is not set. Add it in Settings > Secrets."
-            exit 1
-          fi
-          echo "image=docker.io/${{ secrets.DOCKERHUB_USERNAME }}/smart_attendance_system" >> $GITHUB_OUTPUT
-          echo "Image will be: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/smart_attendance_system"
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY}/face-attendance"
+          echo "image=$(echo $IMAGE | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+          echo "sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+          if [[ "${GITHUB_REF}" == refs/heads/main ]]; then echo "latest=latest" >> $GITHUB_OUTPUT; fi
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then echo "release=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT; fi
 
-      # Only validate/login when we are going to push
-      - name: Validate Docker Hub secrets
-        if: inputs.push_image == true
-        run: |
-          if [ -z "${{ secrets.DOCKERHUB_USERNAME }}" ] || [ -z "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
-            echo "::error ::Missing DOCKERHUB_USERNAME or DOCKERHUB_TOKEN repository secrets."
-            exit 1
-          fi
-
-      - name: Docker Hub login
-        if: inputs.push_image == true
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
-          registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Compute tags
-        id: meta
-        shell: bash
-        run: |
-          SHA_TAG=$(git rev-parse --short=7 ${{ inputs.build_ref }})
-          echo "sha=${SHA_TAG}" >> $GITHUB_OUTPUT
-
-          IMG="${{ steps.repo.outputs.image }}"
-          TAGS="${IMG}:${SHA_TAG}\n${IMG}:manual"
-          if [ -n "${{ inputs.image_tag }}" ]; then
-            TAGS="${TAGS}\n${IMG}:${{ inputs.image_tag }}"
-          fi
-
-          echo -e "tags<<EOF" >> $GITHUB_OUTPUT
-          echo -e "${TAGS}" >> $GITHUB_OUTPUT
-          echo -e "EOF" >> $GITHUB_OUTPUT
-
-      - name: Build (push controlled by input)
+      # Build only for PRs (no push)
+      - name: Build (PR)
+        if: github.event_name == 'pull_request'
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: ${{ inputs.push_image }}
-          tags: ${{ steps.meta.outputs.tags }}
+          push: false
+          tags: ${{ steps.vars.outputs.image }}:pr-${{ github.event.pull_request.number }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Smoke test container (only if model file exists)
-        shell: bash
+      # Build & push on main/tags
+      - name: Build & Push (main/tags)
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.sha }}
+            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.latest }}
+            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.release }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Optional: quick health check if model file is present
+      - name: Smoke test container (if artifacts exist)
+        if: github.event_name != 'pull_request' && hashFiles('artifacts/head_best.pth') != ''
         run: |
-          IMG="${{ steps.repo.outputs.image }}"
-          TAG="${{ steps.meta.outputs.sha }}"
-          if [ -z "$(ls -1 artifacts 2>/dev/null | grep -E 'head_best\.pth$')" ]; then
-            echo "No artifacts/head_best.pth found; skipping smoke test."
-            exit 0
-          fi
           docker run -d --rm -p 5000:5000 \
             -v "$PWD/artifacts:/app/artifacts" \
-            --name face_test "${IMG}:${TAG}"
-          # probe /health for up to ~60s
-          for i in {1..30}; do
-            curl -fsS http://localhost:5000/health && break || sleep 2
-          done
+            --name face_test ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.sha }}
+          for i in {1..30}; do curl -fsS http://localhost:5000/health && break || sleep 2; done
           curl -fsS http://localhost:5000/health
-          docker logs face_test --tail=50
           docker stop face_test
-
-  # OPTIONAL: deploy to a Linux server via SSH
-  deploy:
-    if: inputs.deploy == true
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          script: |
-            set -e
-            IMG="${{ needs.build.outputs.image }}"
-            SHA="${{ needs.build.outputs.sha }}"
-
-            # Login to Docker Hub on the server
-            echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
-
-            # Pull newly built image
-            docker pull "${IMG}:${SHA}" || docker pull "${IMG}:manual"
-
-            # Ensure persistent data dir exists
-            mkdir -p /opt/face-attendance/artifacts
-
-            # Restart container
-            docker rm -f face_attendance || true
-            docker run -d --name face_attendance -p 5000:5000 \
-              -v /opt/face-attendance/artifacts:/app/artifacts \
-              "${IMG}:${SHA}"
