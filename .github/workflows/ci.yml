@@ -15,27 +15,43 @@ jobs:
     permissions:
       contents: read
       packages: write   # required to push to GHCR
+
     steps:
       - name: Checkout (with LFS for big model files)
         uses: actions/checkout@v4
         with:
           lfs: true
 
-      - name: Set up QEMU (optional for multi-arch)
+      - name: Set up QEMU (optional, multi-arch)
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Compute image name (lowercase) and tags
+      # Compute a normalized image name under GHCR (all lowercase)
+      - name: Compute image name
         id: vars
         shell: bash
         run: |
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY}/face-attendance"
-          echo "image=$(echo $IMAGE | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
-          echo "sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
-          if [[ "${GITHUB_REF}" == refs/heads/main ]]; then echo "latest=latest" >> $GITHUB_OUTPUT; fi
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then echo "release=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT; fi
+          OWNER_LC="${GITHUB_REPOSITORY_OWNER,,}"
+          # You can keep it simple as owner/image, or include repo segment if you like
+          echo "image=ghcr.io/${OWNER_LC}/face-attendance" >> $GITHUB_OUTPUT
+
+      # Generate tags/labels safely (no empty tags)
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.vars.outputs.image }}
+          flavor: |
+            latest=false
+          tags: |
+            type=sha,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=ref,event=tag   # adds v* tags when you push a Git tag
+          labels: |
+            org.opencontainers.image.title=smart-attendance
+            org.opencontainers.image.source=${{ github.repositoryUrl }}
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -44,38 +60,38 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build only for PRs (no push)
-      - name: Build (PR)
+      # PRs: build only (no push)
+      - name: Build (PR, no push)
         if: github.event_name == 'pull_request'
         uses: docker/build-push-action@v6
         with:
           context: .
           push: false
-          tags: ${{ steps.vars.outputs.image }}:pr-${{ github.event.pull_request.number }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Build & push on main/tags
+      # main/tags: build & push to GHCR with all computed tags
       - name: Build & Push (main/tags)
         if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: |
-            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.sha }}
-            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.latest }}
-            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.release }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Optional: quick health check if model file is present
+      # Optional: quick health check if your model file is present
       - name: Smoke test container (if artifacts exist)
         if: github.event_name != 'pull_request' && hashFiles('artifacts/head_best.pth') != ''
         run: |
           docker run -d --rm -p 5000:5000 \
             -v "$PWD/artifacts:/app/artifacts" \
-            --name face_test ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.sha }}
+            --name face_test ${{ steps.vars.outputs.image }}:$(echo "${{ steps.meta.outputs.tags }}" | head -n1 | sed 's/.*://')
           for i in {1..30}; do curl -fsS http://localhost:5000/health && break || sleep 2; done
           curl -fsS http://localhost:5000/health
+          docker logs face_test --tail=50
           docker stop face_test
