@@ -22,8 +22,6 @@ on:
         default: false
 
 env:
-  # Docker Hub repos must be lowercase; adjust the name if desired.
-  IMAGE_NAME: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/smart_attendance_system
   DOCKER_BUILDKIT: "1"
 
 jobs:
@@ -34,6 +32,7 @@ jobs:
       packages: read
     outputs:
       sha: ${{ steps.meta.outputs.sha }}
+      image: ${{ steps.repo.outputs.image }}
     steps:
       - name: Checkout (with LFS if you track weights)
         uses: actions/checkout@v4
@@ -47,7 +46,28 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Docker Hub login (only if pushing)
+      # Compute a proper Docker Hub image name from your secret username
+      - name: Set image name
+        id: repo
+        shell: bash
+        run: |
+          if [ -z "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
+            echo "::error ::Secret DOCKERHUB_USERNAME is not set. Add it in Settings > Secrets."
+            exit 1
+          fi
+          echo "image=docker.io/${{ secrets.DOCKERHUB_USERNAME }}/smart_attendance_system" >> $GITHUB_OUTPUT
+          echo "Image will be: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/smart_attendance_system"
+
+      # Only validate/login when we are going to push
+      - name: Validate Docker Hub secrets
+        if: inputs.push_image == true
+        run: |
+          if [ -z "${{ secrets.DOCKERHUB_USERNAME }}" ] || [ -z "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            echo "::error ::Missing DOCKERHUB_USERNAME or DOCKERHUB_TOKEN repository secrets."
+            exit 1
+          fi
+
+      - name: Docker Hub login
         if: inputs.push_image == true
         uses: docker/login-action@v3
         with:
@@ -58,17 +78,16 @@ jobs:
       - name: Compute tags
         id: meta
         shell: bash
-        env:
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
         run: |
           SHA_TAG=$(git rev-parse --short=7 ${{ inputs.build_ref }})
           echo "sha=${SHA_TAG}" >> $GITHUB_OUTPUT
 
-          TAGS="${IMAGE_NAME}:${SHA_TAG}\n${IMAGE_NAME}:manual"
+          IMG="${{ steps.repo.outputs.image }}"
+          TAGS="${IMG}:${SHA_TAG}\n${IMG}:manual"
           if [ -n "${{ inputs.image_tag }}" ]; then
-            TAGS="${TAGS}\n${IMAGE_NAME}:${{ inputs.image_tag }}"
+            TAGS="${TAGS}\n${IMG}:${{ inputs.image_tag }}"
           fi
-          # multi-line output for build-push-action
+
           echo -e "tags<<EOF" >> $GITHUB_OUTPUT
           echo -e "${TAGS}" >> $GITHUB_OUTPUT
           echo -e "EOF" >> $GITHUB_OUTPUT
@@ -85,27 +104,24 @@ jobs:
       - name: Smoke test container (only if model file exists)
         shell: bash
         run: |
-          # pick the sha tag we just built
+          IMG="${{ steps.repo.outputs.image }}"
           TAG="${{ steps.meta.outputs.sha }}"
           if [ -z "$(ls -1 artifacts 2>/dev/null | grep -E 'head_best\.pth$')" ]; then
             echo "No artifacts/head_best.pth found; skipping smoke test."
             exit 0
           fi
-
           docker run -d --rm -p 5000:5000 \
             -v "$PWD/artifacts:/app/artifacts" \
-            --name face_test ${{ env.IMAGE_NAME }}:${TAG}
-
-          # probe /health up to ~60s
+            --name face_test "${IMG}:${TAG}"
+          # probe /health for up to ~60s
           for i in {1..30}; do
             curl -fsS http://localhost:5000/health && break || sleep 2
           done
-
-          echo "Health:"
           curl -fsS http://localhost:5000/health
           docker logs face_test --tail=50
           docker stop face_test
 
+  # OPTIONAL: deploy to a Linux server via SSH
   deploy:
     if: inputs.deploy == true
     needs: build
@@ -119,13 +135,14 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           script: |
             set -e
+            IMG="${{ needs.build.outputs.image }}"
+            SHA="${{ needs.build.outputs.sha }}"
+
             # Login to Docker Hub on the server
             echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
 
-            # Pull the image we just built (sha tag preferred, fallback to 'manual')
-            IMAGE="${{ env.IMAGE_NAME }}"
-            SHA="${{ needs.build.outputs.sha }}"
-            docker pull "${IMAGE}:${SHA}" || docker pull "${IMAGE}:manual"
+            # Pull newly built image
+            docker pull "${IMG}:${SHA}" || docker pull "${IMG}:manual"
 
             # Ensure persistent data dir exists
             mkdir -p /opt/face-attendance/artifacts
@@ -134,4 +151,4 @@ jobs:
             docker rm -f face_attendance || true
             docker run -d --name face_attendance -p 5000:5000 \
               -v /opt/face-attendance/artifacts:/app/artifacts \
-              "${IMAGE}:${SHA}"
+              "${IMG}:${SHA}"
