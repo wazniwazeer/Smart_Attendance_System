@@ -1,0 +1,10 @@
+Flask
+torch==2.3.*
+torchvision==0.18.*
+facenet-pytorch
+opencv-python-headless
+ultralytics==8.*
+numpy
+pandas
+openpyxl
+filelock

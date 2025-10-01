@@ -1,0 +1,11 @@
+{
+  "yolo_face_weights": "artifacts/yolov8n-face.pt",
+  "yolo_conf": 0.35,
+  "yolo_iou": 0.50,
+  "yolo_imgsz": 640,
+  "max_det": 3,
+  "margin": 0.30,
+  "img_size_for_emb": 160,
+  "unknown_conf_thres": 0.55,
+  "embed_dim": 512
+}
